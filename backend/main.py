@@ -8,11 +8,19 @@ import uvicorn
 from datetime import datetime, timedelta
 import random
 import math
+import requests
+import os
+from dotenv import load_dotenv
+
 
 from database import SessionLocal, engine, Base
 from models import User, Location, RiskPrediction
 from schemas import UserCreate, UserResponse, LocationRequest, RiskResponse, RouteRequest, RouteResponse
 from auth import get_password_hash, verify_password, create_access_token, get_current_user
+
+
+load_dotenv()
+KAKAO_API_KEY = os.getenv("KAKAO_API_KEY", "YOUR_KAKAO_REST_API_KEY")
 
 # 데이터베이스 테이블 생성
 Base.metadata.create_all(bind=engine)
@@ -179,6 +187,176 @@ async def get_safe_route(route_request: RouteRequest):
     )
 
 # 유틸리티 함수들
+
+@app.get("/search-location")
+async def search_location(query: str):
+    """카카오맵 API를 사용한 지명 검색 - 400 오류 해결"""
+    
+    if not query or len(query) < 2:
+        return {"places": []}
+    
+    # API 키 확인
+    if not KAKAO_API_KEY or KAKAO_API_KEY == "YOUR_KAKAO_REST_API_KEY":
+        return {"places": [], "error": "카카오 API 키가 설정되지 않았습니다."}
+    
+    try:
+        url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+        headers = {
+            "Authorization": f"KakaoAK {KAKAO_API_KEY}"
+            # Content-Type 제거 (GET 요청에는 불필요)
+        }
+        
+        # 파라미터 수정 - 문제가 되는 빈 값들 제거
+        params = {
+            "query": query.strip(),  # 앞뒤 공백 제거
+            "size": 5,               # 10 → 5로 변경
+            "page": 1,               # 페이지 명시
+            "sort": "accuracy"       # 정렬 기준 명시
+            # category_group_code 제거 (빈 값이 400 오류 원인)
+        }
+        
+        # 서울 지역으로 검색 범위 제한 (선택사항)
+        # params["rect"] = "126.734086,37.413294,127.269311,37.715133"  # 서울시 경계
+        
+        print(f"카카오 API 호출: {url}")
+        print(f"파라미터: {params}")
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        
+        # 상세 오류 정보 출력
+        if response.status_code != 200:
+            print(f"카카오 API 응답 코드: {response.status_code}")
+            print(f"응답 내용: {response.text}")
+            
+            # 400 오류 시 상세 정보 출력
+            if response.status_code == 400:
+                try:
+                    error_data = response.json()
+                    print(f"오류 상세: {error_data}")
+                except:
+                    pass
+                    
+        response.raise_for_status()
+        
+        data = response.json()
+        places = data.get("documents", [])
+        
+        print(f"검색 결과: {len(places)}개 찾음")
+        
+        # 응답 데이터 포맷팅
+        formatted_places = []
+        for place in places:
+            formatted_place = {
+                "place_name": place.get("place_name", ""),
+                "address_name": place.get("address_name", ""),
+                "road_address_name": place.get("road_address_name", ""),
+                "x": place.get("x", ""),  # 경도
+                "y": place.get("y", ""),  # 위도
+                "category_name": place.get("category_name", ""),
+                "phone": place.get("phone", ""),
+                "place_url": place.get("place_url", "")
+            }
+            formatted_places.append(formatted_place)
+        
+        return {
+            "places": formatted_places,
+            "total_count": len(formatted_places)
+        }
+        
+    except requests.exceptions.HTTPError as e:
+        error_msg = f"카카오맵 API HTTP 오류: {e}"
+        print(error_msg)
+        
+        if e.response.status_code == 400:
+            try:
+                error_detail = e.response.json()
+                print(f"400 오류 상세: {error_detail}")
+                return {"places": [], "error": f"잘못된 요청: {error_detail.get('message', '알 수 없는 오류')}"}
+            except:
+                return {"places": [], "error": "잘못된 요청 형식입니다."}
+        elif e.response.status_code == 401:
+            return {"places": [], "error": "API 키가 유효하지 않습니다."}
+        elif e.response.status_code == 403:
+            return {"places": [], "error": "API 키 권한이 없습니다."}
+        elif e.response.status_code == 429:
+            return {"places": [], "error": "API 호출 한도를 초과했습니다."}
+        else:
+            return {"places": [], "error": f"API 호출 실패: {e.response.status_code}"}
+            
+    except requests.exceptions.Timeout:
+        return {"places": [], "error": "검색 시간이 초과되었습니다."}
+        
+    except Exception as e:
+        error_msg = f"지명 검색 오류: {e}"
+        print(error_msg)
+        return {"places": [], "error": "검색 중 오류가 발생했습니다."}
+
+
+# 대안: 주소 검색 API도 추가
+@app.get("/search-address")
+async def search_address(query: str):
+    """카카오맵 주소 검색 API (키워드 검색의 대안)"""
+    
+    if not query or len(query) < 2:
+        return {"addresses": []}
+    
+    try:
+        url = "https://dapi.kakao.com/v2/local/search/address.json"
+        headers = {
+            "Authorization": f"KakaoAK {KAKAO_API_KEY}"
+        }
+        params = {
+            "query": query.strip(),
+            "size": 5
+        }
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        addresses = data.get("documents", [])
+        
+        formatted_addresses = []
+        for addr in addresses:
+            formatted_addr = {
+                "place_name": addr.get("address_name", ""),
+                "address_name": addr.get("address_name", ""),
+                "road_address_name": addr.get("road_address", {}).get("address_name", ""),
+                "x": addr.get("x", ""),  # 경도
+                "y": addr.get("y", ""),  # 위도
+                "category_name": "주소"
+            }
+            formatted_addresses.append(formatted_addr)
+        
+        return {
+            "places": formatted_addresses,  # 프론트엔드 호환성을 위해 "places"로 반환
+            "total_count": len(formatted_addresses)
+        }
+        
+    except Exception as e:
+        print(f"주소 검색 오류: {e}")
+        return {"places": [], "error": "주소 검색 중 오류가 발생했습니다."}
+
+
+# 통합 검색 함수 (키워드 + 주소 검색)
+@app.get("/search-location-combined")
+async def search_location_combined(query: str):
+    """키워드 검색과 주소 검색을 함께 시도"""
+    
+    # 먼저 키워드 검색 시도
+    keyword_result = await search_location(query)
+    
+    if keyword_result.get("places"):
+        return keyword_result
+    
+    # 키워드 검색 실패 시 주소 검색 시도
+    print("키워드 검색 실패, 주소 검색 시도")
+    address_result = await search_address(query)
+    
+    return address_result
+
+
+
 def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """두 좌표 간 거리 계산 (km)"""
     R = 6371  # 지구 반지름 (km)
